@@ -332,6 +332,7 @@ EXPORT_SYMBOL(arp_send);
 
 static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
 {
+	// 1.确定 sender IP
 	__be32 saddr = 0;
 	u8 dst_ha[MAX_ADDR_LEN], *dst_hw = NULL;
 	struct net_device *dev = neigh->dev;
@@ -372,7 +373,7 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
 
 	if (!saddr)
 		saddr = inet_select_addr(dev, target, RT_SCOPE_LINK);
-
+	// 根据 probes 决定探测类型
 	probes -= NEIGH_VAR(neigh->parms, UCAST_PROBES);
 	if (probes < 0) {
 		if (!(READ_ONCE(neigh->nud_state) & NUD_VALID))
@@ -386,7 +387,7 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
 			return;
 		}
 	}
-
+	// 带上可选的 dst，然后发包
 	if (skb && !(dev->priv_flags & IFF_XMIT_DST_RELEASE))
 		dst = skb_dst(skb);
 	arp_send_dst(ARPOP_REQUEST, ETH_P_ARP, target, dev, saddr,

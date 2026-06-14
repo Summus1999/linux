@@ -295,9 +295,9 @@ static void arp_solicit(struct neighbour *neigh, struct sk_buff *skb)
 ```
 
 ARP probe分为以下三种情况：
-PROBE 阶段、有旧 MAC → 内核单播 ARP 确认过期条目
-INCOMPLETE 首次解析、无 MAC → 内核广播 ARP
-配置了 app_solicit → 内核通过 netlink 委托用户态，自己暂不发 ARP；用户态负责解析/更新，内核仍管 neighbour 表
+- PROBE 阶段、有旧 MAC → 内核单播 ARP 确认过期条目
+- INCOMPLETE 首次解析、无 MAC → 内核广播 ARP
+- 配置了 app_solicit → 内核通过 netlink 委托用户态，自己暂不发 ARP；用户态进程负责解析/更新，内核仍管 neighbour 表
 
 **关键参数**：
 - `arp_announce`：选哪个本机 IP 作为 ARP 请求的 sender IP
@@ -305,6 +305,8 @@ INCOMPLETE 首次解析、无 MAC → 内核广播 ARP
 - `mcast_probes / ucast_probes / app_probes`：不同阶段的探测次数上限
 
 ### 5.3 arp_create 构造报文
+
+`arp_create`分配一个 sk_buff，把二层头 + ARP 头 + ARP 载荷填好，返回可直接交给 arp_xmit() 发送的 skb
 
 ```c
 struct sk_buff *arp_create(int type, int ptype, __be32 dest_ip,
@@ -414,6 +416,23 @@ out:
 	return NULL;
 }
 ```
+ARP报文封装流程图：
+```text
+arp_create()
+    │
+    ├─ alloc_skb()           分配缓冲区
+    ├─ skb_reserve(hlen)     给二层头留空
+    ├─ skb_put(arp_len)      划出 ARP 区
+    │
+    ├─ dev_hard_header()     填以太网头 (dst/src MAC + 0x0806)
+    │
+    ├─ 填 arphdr             ar_hrd/ar_pro/ar_hln/ar_pln/ar_op
+    │
+    ├─ 填 SHA + SIP          发送方 MAC/IP
+    ├─ 填 THA + TIP         目标 MAC/IP
+    │
+    └─ return skb            交给 arp_xmit() 发送
+```
 
 ### 5.4 arp_xmit 发送
 
@@ -503,7 +522,7 @@ out_of_mem:
 
 这是 ARP 包处理的“大脑”。
 
-#### ① 报文合法性校验
+#### 6.2.1 报文合法性校验
 
 ```c
 static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -570,7 +589,7 @@ if (arp->ar_op != htons(ARPOP_REPLY) &&
 		goto out_free_skb;
 ```
 
-#### ② 提取字段
+#### 6.2.2 提取字段
 
 ```c
 	arp_ptr = (unsigned char *)(arp + 1);
@@ -590,7 +609,7 @@ if (arp->ar_op != htons(ARPOP_REPLY) &&
 	memcpy(&tip, arp_ptr, 4);
 ```
 
-#### ③ 对 ARP Request 的处理
+#### 6.2.3 对 ARP Request 的处理
 
 ```c
 	/* Special case: IPv4 duplicate address detection packet (RFC2131) */
@@ -655,11 +674,11 @@ if (arp->ar_op != htons(ARPOP_REPLY) &&
 ```
 
 重点：
-- 收到请求自己的 ARP Request 时，**先学习对方**（`neigh_event_ns` 创建/更新邻居为 `NUD_STALE`），**再回复**。
-- `arp_ignore` 控制是否回复（常见 `arp_ignore=1` 只在目标 IP 属于入接口时才回）。
+- 收到请求自己的 ARP Request 时，先学习对方（`neigh_event_ns` 创建/更新邻居为 `NUD_STALE`），再回复。
+- `arp_ignore` 控制是否回复（常见 `arp_ignore=1` 只在target IP 属于入接口时才回）。
 - 这里的 `ip_route_input_noref()` 是接收路径里的路由判定，用于判断 `tip` 是本机地址、可转发地址还是代理 ARP 候选地址。
 
-#### ④ 对 ARP Reply / 免费 ARP 的处理
+#### 6.2.4 对 ARP Reply / 免费 ARP 的处理
 
 ```c
 	/* Update our ARP tables */
@@ -750,9 +769,9 @@ static bool arp_is_garp(struct net *net, struct net_device *dev,
 }
 ```
 
-免费 ARP 用途：
-1. **IP 冲突检测**：启动时发 GARP，看是否有人回。
-2. **更新别人 ARP 缓存**：HA/主备切换时主动刷新 MAC。
+**免费ARP用途**：
+1. IP 冲突检测：启动时发 GARP，看是否有人回。
+2. 更新别人 ARP 缓存：HA/主备切换时主动刷新 MAC。
 
 Linux 默认 **`arp_accept=0`**：不根据 GARP 创建新邻居，只更新已有条目。设 `arp_accept=1` 才会创建。
 
@@ -854,17 +873,15 @@ static int arp_constructor(struct neighbour *neigh)
 
 ---
 
-## 10. 逐行精讲 `arp_process()`
+## 9. 解析 `arp_process()`
 
-`arp_process()` 是 ARP 报文处理的真正核心，位于 `net/ipv4/arp.c:702`。它由 `arp_rcv()` 经过 Netfilter `NF_ARP_IN` 链后调用。函数签名：
+`arp_process()` 是 ARP 报文处理的真正核心，位于 `net/ipv4/arp.c:702`。它由 `arp_rcv()` 经过 Netfilter `NF_ARP_IN` 链后调用。函数签名：这里 `sk` 恒为 `NULL`。
 
 ```c
 static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
 ```
 
-虽然签名里有 `sk`，但 ARP 不是基于 socket 的协议，这里 `sk` 恒为 `NULL`。
-
-### 10.1 局部变量与入口
+### 9.1 局部变量与入口
 
 ```c
 static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -896,7 +913,7 @@ static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
 | `reply_dst` | 隧道元数据回复用的 dst，普通场景为 NULL |
 | `is_garp` | 是否为免费 ARP |
 
-### 10.2 第一阶段：基础合法性校验
+### 9.2 第一阶段：基础合法性校验
 
 ```c
     if (!in_dev)
@@ -996,9 +1013,9 @@ static int arp_process(struct net *net, struct sock *sk, struct sk_buff *skb)
 
 Frame Relay 特殊处理：源二层地址用广播地址。
 
-### 10.5 第四阶段：处理 ARP Request
+### 9.5 第四阶段：处理 ARP Request
 
-#### 10.5.1 DAD（重复地址检测）特殊处理
+#### 9.5.1 DAD（重复地址检测）特殊处理
 
 ```c
     if (sip == 0) {
@@ -1011,11 +1028,11 @@ Frame Relay 特殊处理：源二层地址用广播地址。
     }
 ```
 
-- `sip == 0` 对应 IPv4 Address Conflict Detection / ARP Probe 场景，规范应参考 RFC 5227。源码注释写的是 `RFC2131`，这是 DHCP 客户端冲突检测语境下的历史注释；文档讨论通用 IPv4 DAD/ACD 行为时不应把 RFC 2131 当作主引用。
+- `sip == 0` 对应 IPv4 Address Conflict Detection / ARP Probe 场景，规范应参考 RFC 5227。源码注释写的是 `RFC2131`，这是 DHCP 客户端冲突检测语境下的历史注释。
 - 如果 `tip` 是本机地址，且 `arp_ignore` 允许，则回复。
 - 回复的 target IP 是 0，这是合法的。
 
-#### 10.5.2 请求本机地址
+#### 9.5.2 请求本机地址
 
 ```c
     if (arp->ar_op == htons(ARPOP_REQUEST) &&
@@ -1056,7 +1073,7 @@ Frame Relay 特殊处理：源二层地址用广播地址。
 6. `arp_send_dst(...)`：构造并发送 ARP Reply。
 7. `neigh_release(n)`：释放 `neigh_event_ns` 获得的引用。
 
-#### 10.5.3 代理 ARP 处理
+#### 9.5.3 代理 ARP 处理
 
 ```c
         } else if (IN_DEV_FORWARD(in_dev)) {
@@ -1097,7 +1114,7 @@ Frame Relay 特殊处理：源二层地址用广播地址。
 
 **代理延迟**：如果 `proxy_delay != 0` 且不是本机队列重入、不是单播给自己的报文，则把 skb 入代理队列 `pneigh_enqueue`，延迟后再由 `parp_redo()` 重新处理。这是为了防御 ARP 代理泛洪。
 
-### 10.6 第五阶段：处理 ARP Reply / 更新 ARP 表
+### 9.6 第五阶段：处理 ARP Reply / 更新 ARP 表
 
 ```c
     n = __neigh_lookup(&arp_tbl, &sip, dev, 0);
@@ -1162,7 +1179,7 @@ Frame Relay 特殊处理：源二层地址用广播地址。
   - 如果是 GARP，强制覆盖（用于 HA 切换主动刷新 MAC）。
 - 最后 `neigh_update()` 更新 MAC 和状态。
 
-### 10.7 出口路径
+### 9.7 出口路径
 
 ```c
 out_consume_skb:
@@ -1181,9 +1198,9 @@ out_free_skb:
 
 ---
 
-## 11. 邻居子系统
+## 10. 邻居子系统
 
-### 11.1 `struct neighbour` 关键字段
+### 10.1 `struct neighbour` 关键字段
 
 ```c
 struct neighbour {
@@ -1232,7 +1249,7 @@ struct neighbour {
 | `confirmed` | 上次确认可达时间 |
 | `used` | 上次使用时间，用于 GC |
 
-### 11.2 邻居创建流程
+### 10.2 邻居创建流程
 
 ```text
 上层需要发送 IP 包
@@ -1276,7 +1293,7 @@ INIT_LIST_HEAD(&n->managed_list);
 - 广播/lo/P2P/NOARP → `NUD_NOARP`。
 - 普通单播 → `NUD_NONE`，output 指向 `neigh_resolve_output`。
 
-### 11.3 邻居查找
+### 10.3 邻居查找
 
 ```c
 struct neighbour *__neigh_lookup(struct neigh_table *tbl,
@@ -1290,7 +1307,7 @@ struct neighbour *__neigh_lookup(struct neigh_table *tbl,
 
 查找通过 `tbl->hash(pkey, dev, hash_rnd)` 计算哈希桶，再遍历链表比较 `dev` + `primary_key`。
 
-### 11.4 垃圾回收
+### 10.4 垃圾回收
 
 #### 周期性 GC：`neigh_periodic_work()`
 
@@ -1389,11 +1406,11 @@ out:
 
 ---
 
-## 12. ARP 请求触发、排队、超时完整链路
+## 11. ARP 请求触发、排队、超时完整链路
 
 这是 Linux ARP 最精髓的部分。一句话总结：IP 包先发到一个“未解析”的 neighbour，neighbour 子系统把包挂起并触发 ARP 探测，收到 Reply 后再把挂起的包发出去。
 
-### 12.1 触发：从 IP 层到 `neigh_resolve_output()`
+### 11.1 触发：从 IP 层到 `neigh_resolve_output()`
 
 当 IP 层要发送一个报文时：
 
@@ -1406,7 +1423,7 @@ ip_queue_xmit(skb)
 
 如果 neighbour 状态不是 `NUD_CONNECTED`，`output` 指向 `neigh_resolve_output()`。
 
-### 12.2 `neigh_resolve_output()`：解析入口
+### 11.2 `neigh_resolve_output()`：解析入口
 
 ```c
 int neigh_resolve_output(struct neighbour *neigh, struct sk_buff *skb)
@@ -1468,7 +1485,7 @@ static __always_inline int neigh_event_send_probe(struct neighbour *neigh,
 - 如果已经是 CONNECTED/DELAY/PROBE 状态，不重复触发，直接返回 0。
 - 否则进入 `__neigh_event_send()`。
 
-### 12.3 `__neigh_event_send()`：状态机启动与排队
+### 11.3 `__neigh_event_send()`：状态机启动与排队
 
 ```c
 int __neigh_event_send(struct neighbour *neigh, struct sk_buff *skb,
@@ -1486,9 +1503,9 @@ int __neigh_event_send(struct neighbour *neigh, struct sk_buff *skb,
 		goto out_dead;
 ```
 
-**再次检查**：加锁后再次检查状态，防止并发。
+再次检查：加锁后再次检查状态，防止并发。
 
-#### 12.3.1 从未解析状态启动探测
+#### 11.3.1 从未解析状态启动探测
 
 ```c
 	if (!(neigh->nud_state & (NUD_STALE | NUD_INCOMPLETE))) {
@@ -1528,7 +1545,7 @@ int __neigh_event_send(struct neighbour *neigh, struct sk_buff *skb,
   - `immediate_ok=true`（常规路径）：定时器在 `RETRANS_TIME` 后触发，但会立即发第一次 probe（见下文）。
   - `immediate_ok=false`：定时器 1 个 jiffy 后触发。
 
-#### 12.3.2 STALE 状态的处理
+#### 11.3.2 STALE 状态的处理
 
 ```c
 	} else if (neigh->nud_state & NUD_STALE) {
@@ -1545,7 +1562,7 @@ int __neigh_event_send(struct neighbour *neigh, struct sk_buff *skb,
 - 在 `DELAY_PROBE_TIME` 内如果上层继续使用，则直接发；超时后再转 PROBE。
 - 这是为了批量流量时减少 ARP 请求。
 
-#### 12.3.3 排队待解析的 skb
+#### 11.3.3 排队待解析的 skb
 
 ```c
 	if (neigh->nud_state == NUD_INCOMPLETE) {
@@ -1589,7 +1606,7 @@ out_unlock_bh:
 - `immediate_ok=true` 时，这里立即调用 `neigh_probe()` 发第一次 ARP Request。
 - 定时器仍然会在 `RETRANS_TIME` 后触发，用于重传。
 
-### 12.4 `neigh_probe()`：真正发送 ARP 请求
+### 11.4 `neigh_probe()`：真正发送 ARP 请求
 
 ```c
 static void neigh_probe(struct neighbour *neigh)
@@ -1611,7 +1628,7 @@ static void neigh_probe(struct neighbour *neigh)
 - `arp_solicit()` 根据 skb 的源 IP 决定 sender IP（受 `arp_announce` 控制）。
 - `probes` 计数加 1。
 
-### 12.5 `neigh_timer_handler()`：定时器超时与重传
+### 11.5 `neigh_timer_handler()`：定时器超时与重传
 
 ```c
 static void neigh_timer_handler(struct timer_list *t)
@@ -1634,7 +1651,7 @@ static void neigh_timer_handler(struct timer_list *t)
 
 `NUD_IN_TIMER` 包含 `NUD_INCOMPLETE | NUD_REACHABLE | NUD_DELAY | NUD_PROBE`。非这些状态不处理。
 
-#### 12.5.1 REACHABLE 超时
+#### 11.5.1 REACHABLE 超时
 
 ```c
 	if (state & NUD_REACHABLE) {
@@ -1660,7 +1677,7 @@ static void neigh_timer_handler(struct timer_list *t)
 	}
 ```
 
-#### 12.5.2 DELAY 超时
+#### 11.5.2 DELAY 超时
 
 ```c
 	} else if (state & NUD_DELAY) {
@@ -1685,7 +1702,7 @@ static void neigh_timer_handler(struct timer_list *t)
 	}
 ```
 
-#### 12.5.3 INCOMPLETE / PROBE 超时
+#### 11.5.3 INCOMPLETE / PROBE 超时
 
 ```c
 	} else {
@@ -1694,7 +1711,7 @@ static void neigh_timer_handler(struct timer_list *t)
 	}
 ```
 
-#### 12.5.4 探测次数上限检查
+#### 11.5.4 探测次数上限检查
 
 ```c
 	if ((neigh->nud_state & (NUD_INCOMPLETE | NUD_PROBE)) &&
@@ -1728,7 +1745,7 @@ static __inline__ int neigh_max_probes(struct neighbour *n)
 - `NUD_PROBE` 只由 `NUD_DELAY` 超时进入；进入时 `probes` 被重置为 0，然后按 `UCAST_PROBES`、`APP_PROBES`、`MCAST_REPROBES` 的上限检查。
 - 达到上限后通常标记 `NUD_FAILED`；如果 `NUD_PROBE` 且带 `NTF_EXT_VALIDATED`，则退回 `NUD_STALE`。
 
-#### 12.5.5 重设定时器并继续探测
+#### 11.5.5 重设定时器并继续探测
 
 ```c
 	if (neigh->nud_state & NUD_IN_TIMER) {
@@ -1745,7 +1762,9 @@ out:
 	}
 ```
 
-### 12.6 解析成功：`neigh_update()` 与 `process_arp_queue`
+### 11.6 解析成功：`neigh_update()` 与 `process_arp_queue`
+
+**总结：ARP Reply 到来 → 邻居表写入 MAC 并变为 REACHABLE → 把 ARP 解析期间缓存的包重新 lookup 邻居后发出。**
 
 收到 ARP Reply 后，`arp_process()` 调用：
 
@@ -1833,7 +1852,9 @@ static void neigh_update_process_arp_queue(struct neighbour *neigh)
 - 对每个 skb 重新调用 `neigh->output()`，此时状态已是 REACHABLE，会走 `neigh_connected_output()` 直接发出去。
 - 清空队列。
 
-### 12.7 解析失败：`neigh_invalidate()`
+### 11.7 解析失败：`neigh_invalidate()`
+
+总结：解析失败 → 把 `arp_queue` 里的包逐个报错丢弃 → 上层（如 TCP）感知链路失败并做相应处理。
 
 ```c
 static void neigh_invalidate(struct neighbour *neigh)
@@ -1872,13 +1893,13 @@ static void arp_error_report(struct neighbour *neigh, struct sk_buff *skb)
 }
 ```
 
-对 TCP 来说，`dst_link_failure()` 会触发重传或连接失败通知。
+对 TCP 来说，`dst_link_failure()` 会记录一些错误信息，通知用户态进程。
 
 ---
 
-## 13. 完整 ARP 解析时序图
+## 12. 完整 ARP 解析时序图
 
-### 13.1 正常解析成功
+### 12.1 正常解析成功
 
 ```text
 时间轴 ──────────────────────────────────────────────>
@@ -1925,7 +1946,7 @@ IP 层      ip_queue_xmit(skb, dst=192.148.1.3)
 网卡驱动     发送成功
 ```
 
-### 13.2 状态机转换完整图
+### 12.2 状态机转换完整图
 
 ```text
 NUD_NONE / NUD_FAILED
@@ -1964,7 +1985,7 @@ NUD_PROBE
           → NUD_FAILED
 ```
 
-### 13.3 探测次数与类型
+### 12.3 探测次数与类型
 
 ```text
 NUD_INCOMPLETE
@@ -1988,9 +2009,9 @@ NUD_PROBE
 
 ---
 
-## 14. 常见问题与调试
+## 13. 常见问题与调试
 
-### 14.1 为什么 ARP 表里有 STALE 状态还能通信？
+### 13.1 为什么 ARP 表里有 STALE 状态还能通信？
 
 `NUD_STALE` 表示 MAC 已过期，但 Linux 不会立即丢弃。当上层继续发包时：
 - `neigh_event_send()` 发现是 `NUD_STALE`，进入 `__neigh_event_send()`。
@@ -2000,7 +2021,7 @@ NUD_PROBE
 
 这是一种性能优化，避免每个过期条目都立刻触发 ARP。
 
-### 14.2 为什么第一次 ping 有点慢？
+### 13.2 为什么第一次 ping 有点慢？
 
 因为目标 IP 的 neighbour 初始是 `NUD_NONE`，需要：
 1. `neigh_event_send()` 启动 INCOMPLETE。
@@ -2010,7 +2031,9 @@ NUD_PROBE
 
 这个延迟就是第一次 ARP 解析时间。
 
-### 14.3 如何观察 ARP 解析过程？
+### 13.3 如何观察 ARP 解析过程？
+
+最简单的方法是虚拟机内开一个tcpdump抓包，观察从ping一个陌生ip到彻底ping通的一个状态机的变化。
 
 ```bash
 # 查看 ARP 表
@@ -2029,7 +2052,7 @@ cat /sys/kernel/debug/tracing/events/skb/skb_kfree/enable
 cat /proc/net/arp
 ```
 
-### 14.4 参数调优示例
+### 13.4 参数调优示例
 
 ```bash
 # 缩短 ARP 探测间隔（毫秒）

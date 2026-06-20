@@ -612,7 +612,25 @@ int ip_output(struct net *net, struct sock *sk, struct sk_buff *skb)
 }
 ```
 
-`ip_finish_output()` → `__ip_finish_output()` 处理分片和 GSO：
+`ip_finish_output()` 先经过 BPF cgroup egress 过滤，通过后才调用 `__ip_finish_output()` 处理分片和 GSO：
+
+```c
+static int ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+	int ret;
+
+	ret = BPF_CGROUP_RUN_PROG_INET_EGRESS(sk, skb);
+	switch (ret) {
+	case NET_XMIT_SUCCESS:
+		return __ip_finish_output(net, sk, skb);
+	case NET_XMIT_CN:
+		return __ip_finish_output(net, sk, skb) ? : ret;
+	default:
+		kfree_skb_reason(skb, SKB_DROP_REASON_BPF_CGROUP_EGRESS);
+		return ret;
+	}
+}
+```
 
 ```c
 static int __ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *skb)
@@ -998,6 +1016,16 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb, int *refs)
 		goto err;
 	}
 
+	/* ipfrag_max_dist 防分片攻击：若同一源 IP 的 IP ID 跳跃超过
+	 * max_dist（默认 64），认为对方在乱序轰炸，重置重组队列。
+	 */
+	if (!(IPCB(skb)->flags & IPSKB_FRAG_COMPLETE) &&
+	    unlikely(ip_frag_too_far(qp)) &&
+	    unlikely(err = ip_frag_reinit(qp))) {
+		inet_frag_kill(&qp->q, refs);
+		goto err;
+	}
+
 	ecn = ip4_frag_ecn(ip_hdr(skb)->tos);
 	offset = ntohs(ip_hdr(skb)->frag_off);
 	flags = offset & ~IP_OFFSET;
@@ -1084,7 +1112,7 @@ static int ip_frag_queue(struct ipq *qp, struct sk_buff *skb, int *refs)
 
 重组逻辑：
 - 用 `(saddr, daddr, protocol, id, user, vif)` 作为重组队列键。
-- 把每个分片按 `offset` 插入红黑树，检测重叠/冲突。
+- `inet_frag_queue_insert()` 按 `offset` 插入分片并检测重叠/冲突，使用混合策略：按序到达的分片走链表 run 追加（`fragrun_append_to_last()` / `fragrun_create()`，O(1)）；乱序分片才退化为红黑树 `q->rb_fragments` 二分查找 + 插入（O(log n)）。
 - `MF=0` 的分片标志 `INET_FRAG_LAST_IN` 并记录总长度 `qp->q.len`。
 - 当 `FIRST_IN | LAST_IN` 都收到且 `meat == len` 时，调用 `ip_frag_reasm()` 拼回完整报文。
 - 重组超时（默认 30 秒）触发 `ip_expire()`。只有本机交付等特定场景会回送 `ICMP_TIME_EXCEEDED / ICMP_EXC_FRAGTIME`；转发路径通常静默丢弃：

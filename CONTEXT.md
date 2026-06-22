@@ -1,6 +1,6 @@
 # 对话上下文续接文件
 
-> 最近更新：2026-06-21  
+> 最近更新：2026-06-22（新增第 9 节：从"读懂源码"到"高手"的完整学习路线）  
 > 用途：下次开启新对话时，将此文件内容粘贴给 AI，即可恢复当前讨论上下文。
 
 ---
@@ -100,7 +100,7 @@
   - 四大核心抽象：Socket 抽象层 / 网络设备层 / 协议注册与分发表层 / 报文抽象层
   - **已通过完整 review 并修复全部 P0/P1/P2 问题**（详见第 7 节）
   - 已提交：commit `7b710e503cf9`，已 push 到 master
-- [ ] 下一步：进入下一学习阶段（见第 8 节）
+- [ ] 下一步：进入**数据通路深潜**阶段（见第 8 节，首篇 `docs/datapath-study.md`）
 
 ---
 
@@ -148,40 +148,169 @@
 
 ## 8. 下一学习阶段目标：数据通路深潜 + 路由子系统
 
-> 前置阶段已完成”框架骨架”（socket / net_device / sk_buff / 协议分发表）。下一阶段目标：把这些骨架串成完整的数据通路，并补上路由子系统。
+> 前置阶段已完成"框架骨架"（socket / net_device / sk_buff / 协议分发表）。下一阶段目标：把这些骨架串成完整的数据通路，并补上路由子系统。
+>
+> **总体判断**：当前 5 篇协议笔记（ARP/IP/ICMP/TCP/UDP）是"单点知识"，framework 笔记是"骨架"，但骨架之间的"数据流"还没亲手追过一遍。最高 ROI 的下一步是 **数据通路深潜**——追一个包的完整生命周期，这会让前面所有笔记"激活"。
 
-### 8.1 数据通路深潜：RX/TX 完整生命周期
+### 8.1 数据通路深潜：RX/TX 完整生命周期 ⭐ 首选
+
+**为什么先做这个**：framework 文档里 §2.5/§3.8/§13 已经画了 RX/TX 的概览调用链，但只是"地图"，没有逐函数深入。亲手追一遍后，IP/TCP/UDP 笔记里那些孤立的函数会自动连成通路，理解会产生质变。
 
 **学习目标**：
-- 亲手追一个包的完整生命周期，画两张完整调用链图
-- **RX 路径**：NIC IRQ → NAPI poll → `net_rx_action` → `__netif_receive_skb_core` → `ip_rcv` → `ip_local_deliver` → `tcp_v4_rcv` → socket 接收队列 → 唤醒 `recvmsg`
-- **TX 路径**：`tcp_sendmsg` → `tcp_write_xmit` → `ip_queue_xmit` → `ip_output` → `ip_finish_output2`（查 neighbour）→ `dev_queue_xmit` → qdisc → `dev_hard_start_xmit` → NIC
-- 重点理解各层的 `skb_push`/`skb_pull` 头部增删时机
+- 亲手追一个包的完整生命周期，画两张完整调用链图（逐函数，含 `skb_push`/`skb_pull` 头部增删时机）
+- **RX 路径**：NIC IRQ → NAPI poll → `net_rx_action` → `__netif_receive_skb_core` → `ip_rcv` → `ip_rcv_core`/`ip_rcv_finish` → `ip_local_deliver` → `ip_local_deliver_finish` → `ip_protocol_deliver_rcu` → `tcp_v4_rcv` → `tcp_v4_do_rcv` → `tcp_rcv_established` → socket 接收队列 → 唤醒 `recvmsg`
+- **TX 路径**：`tcp_sendmsg` → `tcp_sendmsg_locked`（构造 skb 入发送队列）→ `tcp_write_xmit`（拥塞/窗口判断）→ `tcp_transmit_skb` → `ip_queue_xmit` → `ip_local_out` → `ip_output` → `ip_finish_output`（分片/iptables POSTROUTING）→ `ip_finish_output2`（查 neighbour）→ `neigh_output` → `dev_queue_xmit` → `__dev_queue_xmit`（qdisc）→ `dev_hard_start_xmit` → `ndo_start_xmit` → NIC
+- 重点理解每一层的 `skb_push`/`skb_pull`/`skb_reserve` 时机，以及 `skb->protocol`、各 header offset 的设置点
 
 **重点文件**：
 - `net/ipv4/tcp_input.c`（接收 fast path / slow path）
 - `net/ipv4/tcp_output.c`（发送路径）
 - `net/ipv4/ip_output.c`、`net/ipv4/ip_input.c`
+- 复用 `net/core/dev.c`（framework 已覆盖，此处聚焦与 IP 层的衔接）
 
-**输出物**：`docs/datapath-study.md`
+**输出物**：`docs/datapath-study.md`（建议结构：RX 全链路逐函数 / TX 全链路逐函数 / 两张完整调用链图 / 头部增删时序表）
+
+**验收标准**：
+- [ ] 能不看文档画出 RX 从硬中断到 `tcp_rcv_established` 的完整调用链
+- [ ] 能不看文档画出 TX 从 `tcp_sendmsg` 到 `ndo_start_xmit` 的完整调用链
+- [ ] 能说清每一层在哪里 `skb_push` 加头、哪里 `skb_pull` 剥头
 
 ### 8.2 路由子系统
 
+**为什么放在数据通路之后**：TX 路径里 `ip_queue_xmit` → `ip_route_output_flow` 是必经节点，RX 路径里 `ip_rcv_finish` 的 `dst.input` 路由判定也是核心。先追完数据通路会发现路由是绕不开的瓶颈，这时再学路由子系统目标最明确。
+
 **学习目标**：
-- `struct rtable`、`ip_route_output_flow`
+- `struct rtable`、`ip_route_output_flow`、`ip_route_input_slow`
 - FIB：`net/ipv4/fib_*.c`、`fib_trie`（Linux 用 trie 而非 hash 存路由）
-- `struct flowi4` —— 路由查找的”查询键”
-- 策略路由、multipath、路由 cache 与 FIB 的关系
+- `struct flowi4` —— 路由查找的"查询键"
+- 路由 cache（`rt_cache`）与 FIB 的关系、`dst_entry` 的 role
+- 策略路由（`fib_rules`）、multipath
 
 **重点文件**：
-- `net/ipv4/route.c`、`net/ipv4/fib_*.c`
+- `net/ipv4/route.c`、`net/ipv4/fib_frontend.c`、`net/ipv4/fib_trie.c`、`net/ipv4/fib_rules.c`
 
 **输出物**：`docs/routing-study.md`
 
-### 8.3 后续可选专题（按需推进）
+### 8.3 后续可选专题（按需推进，优先级排序）
 
-- Netfilter + eBPF/XDP（现代 Linux 网络：5 个 hook 点、conntrack、XDP early drop）
-- 性能与内存机制（NAPI 深入、GRO/GSO/TSO、socket 内存压力反压、qdisc/TC）
-- TCP 拥塞控制模块化（`tcp_cong.c` + cubic/bbr）
-- IPv6（`net/ipv6/` 整套）
-- 虚拟化与容器网络（netns、bridge/veth/macvlan、VXLAN/GRE、tun/tap、virtio-net）
+| 优先级 | 专题 | 关键点 | 何时做 |
+|--------|------|--------|--------|
+| 高 | Netfilter + eBPF/XDP | 5 个 hook 点、conntrack、XDP early drop、`BPF_PROG_TYPE_XDP` | 数据通路 + 路由后，理解 hook 点位置后学最顺 |
+| 中 | 性能与内存机制 | NAPI 深入、GRO/GSO/TSO 细节、socket 内存压力反压（`sk_mem_schedule`）、qdisc/TC | framework 已涉猎，可随时深挖 |
+| 中 | TCP 拥塞控制模块化 | `tcp_cong.c` 框架 + `tcp_cubic.c`/`tcp_bbr.c` | TCP 笔记讲的是通用层，这里才是算法内核 |
+| 中 | IPv6 | `net/ipv6/` 整套（`ip6_rcv`/`ip6_route_output`/`tcp_v6_*`） | 与 IPv4 平行，生产不可回避 |
+| 低 | 虚拟化与容器网络 | netns、bridge/veth/macvlan、VXLAN/GRE、tun/tap、virtio-net | 偏运维/云原生，按工作需要推进 |
+
+### 8.4 建议的近期行动
+
+1. **立即**：开 `docs/datapath-study.md`，先画 RX/TX 两张概览图（复用 framework §2.5/§3.8/§13 的内容作为起点）
+2. **第 1 周**：逐函数追 TX 路径（从 `tcp_sendmsg` 到 NIC），因为 TX 比 RX 线性、好追
+3. **第 2 周**：逐函数追 RX 路径（从 NIC 到 `tcp_rcv_established`），RX 分支多、需配合 NAPI 理解
+4. **第 3 周**：进入路由子系统 `docs/routing-study.md`
+
+---
+
+## 9. 从"读懂源码"到"Linux 网络高手"：完整学习路线
+
+> 本节是对前 8 节学习成果的阶段性复盘，并给出从"协议单点知识已齐 + 骨架已立 + 调用链已串通"到"能改、能调、能定位线上问题"的完整路线。判定依据：现有 8 篇笔记覆盖了 L2 框架 / L2.5 邻居 / L3 IPv4+路由 / L3.5 ICMP / L4 TCP+UDP / RX·TX 调用链，但**几乎不碰 Netfilter/eBPF/XDP、性能与可观测性、TCP 拥塞控制算法本体**——这三块是从"读"到"用"的关键距离。
+
+### 9.1 当前水平评估
+
+| 层 | 已覆盖 | 深度 |
+|----|--------|------|
+| L2 框架 | socket / net_device / sk_buff / NAPI / 协议分发表 | 深（2590 行） |
+| L2.5 | ARP + neighbour 子系统 | 深（2070 行） |
+| L3 | IPv4 收发/分片/转发 | 中深 |
+| L3 | 路由子系统（FIB/LC-trie/策略路由/multipath） | 中深 |
+| L3.5 | ICMP | 中深 |
+| L4 | TCP 状态机/收发/拥塞/定时器 | 中（1253 行，单篇） |
+| L4 | UDP | 中 |
+| 横向 | RX/TX 完整调用链 | 中（686 行概览级） |
+
+**瓶颈诊断**：再往协议细节里堆笔记边际收益已低。真正缺的是：① Netfilter/eBPF/XDP（生产网络的实际控制面）；② 性能与可观测性工具链（从"懂"到"能定位"）；③ TCP 拥塞控制算法本体与内部数据结构（从"通用层"到"能调优"）。
+
+### 9.2 学习路线（按 ROI 排序）
+
+#### 第一梯队（必做，决定能否从"读"到"用"）
+
+**① Netfilter + conntrack + nftables**（约 1~2 周）
+- 理由：TX/RX 笔记里 6 处出现 `NF_INET_*` hook 但都跳过，这是"债"；Cilium/Calico/iptables/防火墙/NAT 全靠这层。
+- 重点：`struct nf_hook_ops` 注册机制、5 hook 点与调用时机、conntrack 状态机、NAT 的 `nf_nat` 模块、nftables 替代 iptables 的原因。
+- 输出：`docs/netfilter-study.md`（**骨架已建，待逐节填充**，见第 10 节）
+- 验收：能画出包流经 5 个 hook 的完整图；能解释 `iptables -t nat -A POSTROUTING -j MASQUERADE` 在内核里改了什么。
+
+**② eBPF + XDP**（约 2~3 周）⭐ 2026 年最值得投入的方向
+- 理由：现代 Linux 网络高手的"新护城河"。XDP 在驱动 RX 软中断之前就 drop/redirect/修改包，性能比 iptables 高一个数量级；Cilium、Katran、Cloudflare 都靠它。
+- 重点：`BPF_PROG_TYPE_XDP`/`BPF_PROG_TYPE_SCHED_CLS`、`bpf_redirect`/`bpf_xdp_adjust_meta`、XDP 4 种 action（PASS/DROP/REDIRECT/ABORTED）、AF_XDP 零拷贝、TC BPF。
+- 输出：`docs/ebpf-xdp-study.md`
+- 验收：能写一个 XDP 程序按 IP 黑名单 drop 包；能解释 XDP 与 TC BPF 的挂载层次差异。
+
+**③ TCP 拥塞控制深潜 + `tcp_sock` 内部数据结构**（约 2 周）
+- 理由：TCP 笔记停在"通用框架"。真正的高手能讲清发送队列组织（`sk_write_queue` vs `tcp_rtx_queue` rbtree vs scoreboard）、Cubic 三次曲线、BBR 的 `BtlBw`/`RTprop` 估计、RACK（RFC 8985）丢包检测。
+- 重点：`net/ipv4/tcp_cong.c` 框架、`tcp_cubic.c`、`tcp_bbr.c`、`tcp_rate.c`、`tcp_rack.c`、`tcp_sock` 内部 rbtree。
+- 输出：`docs/tcp-congestion-deepdive.md`
+- 验收：能解释 BBR 为何在长肥管道上打败 Cubic；能看懂 `ss -i` 输出里 `cwnd`/`ssthresh`/`bbr`/`rto` 的含义。
+
+#### 第二梯队（构建系统能力，2~3 个月内逐步推进）
+
+**④ 性能与可观测性工具链**（持续穿插，不单独成篇也要会）
+- `perf trace`/`perf record` 抓网络热路径；`bpftrace` 一行脚本追 `tcp_sendmsg` 延迟分布；`dropwatch -l kas` 定位丢包点；`ss -tin` 看 TCP 内部状态；`nstat -az | grep -i tcp` 看 SNMP 计数。
+- 建议做法：每学一个新子系统，配套写一段"如何用工具观测它"的附录。
+
+**⑤ qdisc / TC / GRO·GSO·TSO 深度**
+- 重点：`sch_fq_codel`/`sch_fq`（BBR 配套）、`htb`/`tbf` 限速、`mq` 多队列、TC class/filter 体系、GSO 在 `__dev_queue_xmit` 的分段时机、TSO 与 `tcp_tso_autosize` 的关系。
+- 输出：`docs/qdisc-tc-study.md`
+
+**⑥ socket 内存管理与反压**（`sk_mem_schedule` / `__sk_mem_raise_allocated`）
+- 重点：`sk_wmem_alloc`/`sk_rmem_alloc`、`tcp_memory_allocated` 全局账本、`tcp_memory_pressure` 反压、`SO_SNDBUF`/`SO_RCVBUF` 与 `sysctl_tcp_mem` 的关系。
+- 这是"高并发场景下卡住 90% 人"的细节，建议单独成篇。
+- 输出：`docs/socket-memory-study.md`
+
+#### 第三梯队（扩展广度，按工作需要推进）
+
+| 优先级 | 专题 | 一句话理由 |
+|--------|------|-----------|
+| 中 | IPv6 全栈 | 与 IPv4 平行，生产不可回避；学到时只需对位差异 |
+| 中 | Netlink 协议族 | `rtnetlink`/`genetlink` 是用户态配网络的唯一正道，写过协议栈的人必学 |
+| 中 | netns + veth/bridge/macvlan | 理解容器网络的基础，Cilium/Calico 都建在这上面 |
+| 低 | tun/tap、VXLAN/GRE、virtio-net | 云原生/虚拟化方向才深挖 |
+| 低 | DCCP/SCTP/MPTCP | MPTCP 已进主线，有研究价值 |
+
+### 9.3 建议的近期行动
+
+1. **立即**：填充 `docs/netfilter-study.md`（骨架已建）——优先 §4 `nf_hook_slow` 完整源码、§5 `nf_register_net_hook` 完整源码、§7 conntrack 状态机图，这是理解后续 eBPF/XDP 的对照基线。
+2. **第 1~2 周**：完成 Netfilter 笔记，配套用 `iptables -t nat -L -v` / `conntrack -L` / `perf trace -e 'net:*nf*'` 观测一次真实 NAT 流量。
+3. **第 3~5 周**：进入 eBPF/XDP，先写一个 XDP drop 黑名单小程序跑通工具链（`clang -target bpf` + `ip link set dev x dp obj`），再深入源码。
+4. **第 6~7 周**：TCP 拥塞控制深潜，配合 `ss -i` 与 `tcp_probe` tracepoint 观察一次 BBR 与 Cubic 的 cwnd 变化。
+5. **持续**：qdisc/socket 内存/可观测性按需穿插。
+
+### 9.4 验收里程碑（"高手"自检清单）
+
+- [ ] 能不看文档画出 RX/TX 从 syscall 到 NIC 的完整调用链（含 5 个 Netfilter hook 位置）
+- [ ] 能用 `bpftrace`/`perf` 一行命令定位"某个连接为什么慢/为什么丢包"
+- [ ] 能解释 BBR 与 Cubic 在长肥管道上的行为差异，并会调 `sysctl` 切换
+- [ ] 能读懂 Cilium 一个 `NetworkPolicy` CR 最终生成了哪些 eBPF 程序、挂在哪些 hook
+- [ ] 能解释 `iptables -t nat -A POSTROUTING -j MASQUERADE` 在 conntrack/NAT 层面改了哪些字段
+- [ ] 能写出 socket 内存反压触发的完整路径（`sk_wmem_alloc` → `tcp_memory_pressure` → 应用 `EAGAIN`）
+
+---
+
+## 10. 文档状态索引
+
+| 文档 | 状态 | 行数 | 最近更新 |
+|------|------|------|----------|
+| `docs/arp-study.md` | ✅ 完成 | 2070 | 2026-06-14 |
+| `docs/icmp-study.md` | ✅ 完成 | 1295 | 2026-06-20 |
+| `docs/ip-study.md` | ✅ 完成 | 1415 | 2026-06-20 |
+| `docs/tcp-study.md` | ✅ 完成 | 1253 | 2026-06-20 |
+| `docs/udp-study.md` | ✅ 完成 | 939 | 2026-06-20 |
+| `docs/network-framework-study.md` | ✅ 完成 | 2590 | 2026-06-21 |
+| `docs/network-send-recv-callchain.md` | ✅ 完成 | 686 | 2026-06-21 |
+| `docs/route-study.md` | ✅ 完成 | 1233 | 2026-06-22 |
+| `docs/netfilter-study.md` | ✅ 核心章节 + 扩展专题完成（2906 行，9 节源码深潜） | 2906 | 2026-06-22 |
+| `docs/datapath-study.md` | ⏳ 待开（第 8.1 节） | — | — |
+| `docs/ebpf-xdp-study.md` | ⏳ 待开（第 9.2 ②） | — | — |
+| `docs/tcp-congestion-deepdive.md` | ⏳ 待开（第 9.2 ③） | — | — |
+| `docs/qdisc-tc-study.md` | ⏳ 待开（第 9.2 ⑤） | — | — |
+| `docs/socket-memory-study.md` | ⏳ 待开（第 9.2 ⑥） | — | — |
+

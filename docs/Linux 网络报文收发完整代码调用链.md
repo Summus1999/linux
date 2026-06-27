@@ -1,6 +1,6 @@
 # Linux 网络报文收发完整代码调用链（TCP/IPv4 主线，Linux v7.1-rc7）
 
-> 本文在 `docs/network-framework-study.md` 的基础上，把**用户 send/recv 到网卡驱动再返回用户**的完整调用链抽出来，形成一张系统的、可逐行对照源码的调用图。
+> 本文在 `docs/Linux 网络框架核心.md` 的基础上，把**用户 send/recv 到网卡驱动再返回用户**的完整调用链抽出来，形成一张系统的、可逐行对照源码的调用图。
 >
 > 约定：
 > - `text` 代码块为教学性的调用图、时序图；
@@ -683,4 +683,4 @@ Linux 网络栈的收发路径可以用两条主线概括：
 4. **发送/接收内存记账**：`skb_set_owner_w/r()` 把 skb 生命周期与 `sk_wmem_alloc` / `sk_rmem_alloc` 绑定，`tcp_wfree()` / `sock_rfree()` 在 skb 释放时归还配额；
 5. **NAPI + GRO**：用软中断轮询替代每包硬中断，用 GRO 聚合减少协议栈入口开销。
 
-把这张图和 `docs/network-framework-study.md` 里的数据结构章节对照阅读，就能从「函数调用顺序」和「数据结构协作」两个维度，建立对 Linux 网络协议栈的完整理解。
+把这张图和 `docs/Linux 网络框架核心.md` 里的数据结构章节对照阅读，就能从「函数调用顺序」和「数据结构协作」两个维度，建立对 Linux 网络协议栈的完整理解。

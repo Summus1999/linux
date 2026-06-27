@@ -22,7 +22,7 @@
 
 与协议栈的关系：Netfilter 不实现任何协议，它只提供"拦截点"。协议栈在 `ip_rcv`/`ip_output`/`ip_forward` 等关键函数里调用 `NF_HOOK(...)` 宏，把报文交给 Netfilter 处理后再决定继续走还是丢弃。
 
-为什么单独成篇学：前序笔记里 `NF_INET_PRE_ROUTING`/`NF_INET_LOCAL_IN`/`NF_INET_FORWARD`/`NF_INET_LOCAL_OUT`/`NF_INET_POST_ROUTING` 这 5 个 hook 至少出现 6 次但都一笔带过。本文把这层"债"补上，也是后续 eBPF/XDP 学习的前置——XDP 的很多设计正是对 Netfilter 性能瓶颈的回应。
+为什么单独成篇学：前序笔记里 `NF_INET_PRE_ROUTING`/`NF_INET_LOCAL_IN`/`NF_INET_FORWARD`/`NF_INET_LOCAL_OUT`/`NF_INET_POST_ROUTING` 这 5 个 hook 至少出现 6 次但都一笔带过，本文系统讲清这层；也是后续 eBPF/XDP 学习的前置，XDP 的很多设计正是对 Netfilter 性能瓶颈的回应。
 
 核心 RFC / 文档：RFC 7511（无关搞笑，跳过）；真实设计文档是 Rusty Russell 的 "Linux Netfilter Hacking HOWTO"；nftables 见 `man 8 nft` 与 `Documentation/networking/nf_flowtable.rst`。
 
@@ -262,7 +262,7 @@ static inline int nf_hook(uint8_t pf, unsigned int hook, struct net *net,
 }
 ```
 
-两个性能优化点（务必记住，这是 Netfilter 在生产环境"还能用"的关键）：
+两个性能优化点：
 
 1. `CONFIG_JUMP_LABEL` + `nf_hooks_needed[pf][hook]` 静态键：当某 `(pf, hook)` 关卡没有任何 hook 注册时，静态键关闭，`NF_HOOK_LIST` 直接 `return`，几乎零开销。只有注册过 hook 的关卡才进入慢路径。这就是"没开 iptables 时几乎不影响性能"的原因。
 2. `NF_HOOK_LIST` 批量处理：NAPI 攒一批 skb 后用 `NF_HOOK_LIST` 一次 `rcu_read_lock` 处理整批，避免每个包单独锁。见 `ip_input.c:681` 的 `ip_list_rcv` 路径。
@@ -271,7 +271,7 @@ static inline int nf_hook(uint8_t pf, unsigned int hook, struct net *net,
 
 文件：`net/netfilter/core.c:610-645`
 
-**这是 Netfilter 的热路径核心**——每个报文经过每个有 hook 的关卡都会进这里。整个函数只有 33 行，但每一行都值得抠。
+**这是 Netfilter 的热路径核心**——每个报文经过每个有 hook 的关卡都会进这里。
 
 源码：
 
@@ -395,7 +395,7 @@ EXPORT_SYMBOL(nf_hooks_needed);
 - **首次注册 hook**时，`nf_static_key_inc`（`core.c:359`）调 `static_key_slow_inc` 启用该键，内核会**动态 patch 所有引用点的指令**，改成走慢路径。
 - **最后一个 hook 注销**后，`nf_static_key_dec` 关闭该键，指令再 patch 回快路径。
 
-**效果**：生产服务器即使编译了 Netfilter，只要没 `iptables -A` 任何规则，IP 收发路径开销几乎为零。这是 Linux 网络栈能让"防火墙功能默认编进内核但默认零开销"的关键设计。
+**效果**：生产服务器即使编译了 Netfilter，只要没 `iptables -A` 任何规则，IP 收发路径开销几乎为零——防火墙功能默认编进内核但默认零开销。
 
 > **对比 eBPF/XDP**：XDP 的 hook 点本身就在驱动 RX 早期，且 BPF 程序直接 JIT 成原生指令执行，没有"线性扫描 hook 数组"的开销。这就是为什么 XDP 比 Netfilter 快一个数量级——但代价是 XDP 程序不能像 Netfilter hook 那样动态增删多个，每个 hook 点同一时间只能挂一个 BPF 程序。
 
@@ -789,7 +789,7 @@ iptables 的 5 张表（filter/nat/mangle/raw/security）× 5 条链（INPUT/OUT
 
 文件：`net/ipv4/netfilter/ip_tables.c:222-362`
 
-**这是 iptables 的热路径核心**——每张表（filter/nat/mangle/raw/security）注册到 Netfilter hook 时，回调函数都是 `ipt_do_table`，`priv` 指向该表的 `xt_table`。报文经过关卡时，`nf_hook_slow` 调用此函数遍历表内规则。
+**这是 iptables 的热路径核心**——每张表注册到 Netfilter hook 时，回调函数都是 `ipt_do_table`，`priv` 指向该表的 `xt_table`。报文经过关卡时，`nf_hook_slow` 调用此函数遍历表内规则。
 
 源码（核心循环部分）：
 
@@ -941,7 +941,7 @@ table->private->entries (连续内存块)
 └─────────────────────────────────────────────────────────┘
 ```
 
-**verdict 编码**（务必记住，看代码常踩坑）：
+**verdict 编码**：
 
 | 用户视角 | 内部存储 | 含义 |
 |----------|----------|------|
@@ -1252,7 +1252,7 @@ repeat:
 1. **跳过已跟踪包**：`nf_ct_get` 读 `skb->_nfct`。若已是 `IP_CT_UNTRACKED`（raw 表 NOTRACK）或已跟踪（loopback 重入），直接 ACCEPT。
 2. **解析 L4 协议**：`get_l4proto` 返回 L4 头偏移和协议号。失败则记 `invalid` 计数并 ACCEPT（不跟踪无法识别的包，而非丢弃）。
 3. **ICMP 特殊路径**：ICMP 差错报文要关联到原连接（`RELATED`），单独处理。
-4. **`resolve_normal_ct`**：查/建 conntrack，设置 `skb->_nfct`。**这是核心**，见 §7.6。
+4. **`resolve_normal_ct`**：查/建 conntrack，设置 `skb->_nfct`。见 §7.6。
 5. **`nf_conntrack_handle_packet`**：调协议状态机（如 TCP 的 `tcp_packet()` 更新 `tcp_conntrack` 状态、检查窗口、判断 SYN/SYN-ACK/FIN）。
 6. **设置 `IPS_SEEN_REPLY`**：收到 reply 方向首包时设置，连接从 NEW 转 ESTABLISHED。
 
@@ -1404,7 +1404,7 @@ cat /proc/net/netfilter/nf_conntrack | head
 
 ### 8.1 NAT 与 conntrack 的关系
 
-**NAT 不是独立 hook，而是挂在 conntrack 之上的附加信息**。理解这点是理解 NAT 的前提：
+**NAT 不是独立 hook，而是挂在 conntrack 之上的附加信息**：
 
 - NAT 没有自己的状态表，**复用 conntrack 的 `nf_conn`**。每条 `nf_conn` 可携带一个 `struct nf_conn_nat` 扩展，记录 NAT 映射。
 - NAT hook（`nf_nat_inet_fn`）只在 conntrack hook 之后执行——它依赖 `skb->_nfct` 已被设置。
@@ -1521,7 +1521,7 @@ oif_changed:
 | 956-961 | `default: ESTABLISHED`——已建立连接的后续包，跳过规则查询 |
 | 964 | `return nf_nat_packet(...)`——**真正改包的地方**，见 §8.4 |
 
-**关键洞察**：NAT 规则（`iptables -t nat -A`）**只对每条连接的首包执行一次**。首包确定映射后写入 `ct->status` 的 `IPS_*_NAT_DONE` 位，后续包看到这个位直接跳过规则查询。这就是为什么 NAT 性能能接受——规则匹配不是 per-packet，是 per-flow-first-packet。
+**关键洞察**：NAT 规则（`iptables -t nat -A`）**只对每条连接的首包执行一次**。首包确定映射后写入 `ct->status` 的 `IPS_*_NAT_DONE` 位，后续包看到这个位直接跳过规则查询——规则匹配是 per-flow-first-packet 而非 per-packet。
 
 ### 8.3 `nf_nat_setup_info`：建立 NAT 映射
 
@@ -1596,11 +1596,11 @@ nf_nat_setup_info(struct nf_conn *ct,
 
 | 行 | 代码 | 说明 |
 |----|------|------|
-| 773 | `if (nf_ct_is_confirmed(ct)) return NF_ACCEPT` | **只能对未确认的 ct 设置 NAT**。确认后 ct 已进全局 hash 表，改 tuple 会破坏一致性。这是为什么 NAT 必须在 `nf_confirm` 之前（priority 更小）执行 |
+| 773 | `if (nf_ct_is_confirmed(ct)) return NF_ACCEPT` | **只能对未确认的 ct 设置 NAT**。确认后 ct 已进全局 hash 表，改 tuple 会破坏一致性。所以 NAT 必须在 `nf_confirm` 之前（priority 更小）执行 |
 | 779 | `if (WARN_ON(nf_nat_initialized(ct, maniptype))) return NF_DROP` | 防止重复设置同方向 NAT |
 | 787-788 | `nf_ct_invert_tuple(&curr_tuple, &ct->tuplehash[REPLY].tuple)` | 取"当前 effective tuple"=reply tuple 的逆。NAT 要改的就是这个 tuple |
 | 790 | `get_unique_tuple(&new_tuple, &curr_tuple, range, ct, maniptype)` | 在 `range` 约束下选一个**可用**的新 tuple（避免端口冲突，`find_free_ipport` 等） |
-| 792-808 | `if (!nf_ct_tuple_equal(&new_tuple, &curr_tuple))` | 新旧 tuple 不同才需要 NAT。**改 reply tuple**（`nf_conntrack_alter_reply`）——这是关键：后续 reply 方向的包靠这个新 tuple 匹配。设 `IPS_SRC_NAT`/`IPS_DST_NAT` 位 |
+| 792-808 | `if (!nf_ct_tuple_equal(&new_tuple, &curr_tuple))` | 新旧 tuple 不同才需要 NAT。**改 reply tuple**（`nf_conntrack_alter_reply`），后续 reply 方向的包靠这个新 tuple 匹配。设 `IPS_SRC_NAT`/`IPS_DST_NAT` 位 |
 | 805-807 | `nfct_seqadj_ext_add` | 若连接有 helper（FTP 等）且 NAT 改了地址，TCP seq 需要调整（`IPS_SEQ_ADJUST`），否则对端因 seq 不匹配而 RST |
 | 810-821 | `hlist_add_head_rcu(&ct->nat_bysource, &nf_nat_bysource[srchash])` | **SNAT 专用**：把 ct 挂到 by-source hash 表。这个表用于"给定源地址，反查已建立的 NAT 连接"，MASQUERADE 反向查找、端口复用都靠它 |
 | 824-827 | `ct->status |= IPS_*_NAT_DONE` | 标记该方向 NAT 已完成。`nf_nat_inet_fn` 后续包靠这个位跳过规则查询 |
@@ -1727,7 +1727,7 @@ static bool nf_nat_ipv4_manip_pkt(struct sk_buff *skb,
 3. **`l4proto_manip_pkt`**——先改 L4（TCP/UDP 端口、ICMP id）。**先改 L4 再改 L3**，因为 L4 校验和依赖 L3 地址，改完 L3 后要更新 L4 校验和。
 4. **改 IP 头**：`csum_replace4(&iph->check, oldip, newip)` 增量更新 IP 头校验和，再写新地址。
 
-**校验和处理**：NAT 不重算整个校验和，而是用 `csum_replace4`/`inet_proto_csum_replace4` **增量更新**——只改变化的部分，O(1) 开销。这是 NAT 能线速的关键之一。
+**校验和处理**：NAT 不重算整个校验和，而是用 `csum_replace4`/`inet_proto_csum_replace4` **增量更新**——只改变化的部分，O(1) 开销。
 
 ### 8.6 完整 NAT 流程图
 
@@ -2074,7 +2074,7 @@ dropwatch -l kas
 
 ## 13. nfqueue：把报文送给用户态裁决
 
-> §14 TODO 第一项。nfqueue 是 Netfilter 的"用户态放风机制"——把内核截获的报文通过 netlink 送给用户态进程（如 `suricata`、`conntrack-tools`、自写 IDS），用户态判决后再回注内核继续走协议栈。
+> nfqueue 把内核截获的报文通过 netlink 送给用户态进程（如 `suricata`、`conntrack-tools`、自写 IDS），用户态判决后再回注内核继续走协议栈。
 
 ### 13.1 触发点：`NF_QUEUE` verdict 的编码
 
@@ -2357,7 +2357,7 @@ cat /proc/net/netfilter/nfnetlink_queue
 
 ## 14. nf_flowtable：流卸载旁路 Netfilter
 
-> §14 TODO 第二项。`nf_flowtable` 是 Netfilter 的"快车道"——对已建立的连接，绕过整个 Netfilter 软件路径（hook 数组、conntrack 查找、iptables 匹配），直接在网卡或轻量 hook 里转发。这是 Linux 内核网络近 5 年最重要的性能优化之一。
+> `nf_flowtable` 对已建立的连接绕过整个 Netfilter 软件路径（hook 数组、conntrack 查找、iptables 匹配），直接在网卡或轻量 hook 里转发。
 
 ### 14.1 解决什么问题
 
@@ -2572,7 +2572,7 @@ nft add rule inet filter forward ct state established accept
 
 ## 15. conntrack helper 与 expectation：相关连接的自动建立
 
-> §14 TODO 第三项。FTP 数据连接、SIP 媒体流、ICMP 差错报文等"相关连接"如何被 conntrack 自动识别并建立？答案在 helper + expectation 机制。
+> FTP 数据连接、SIP 媒体流、ICMP 差错报文等"相关连接"如何被 conntrack 自动识别并建立？答案在 helper + expectation 机制。
 
 ### 15.1 解决什么问题
 
@@ -2883,11 +2883,190 @@ Netfilter 是 Linux 网络的"控制平面"，把 5 个 hook 点埋在 IP 协议
 - **nf_flowtable**：已建立连接旁路 Netfilter 软件路径（§14）
 - **helper + expectation**：相关连接自动识别（§15）
 
-学完本文后，下一步是 eBPF/XDP——它把"拦截点"从 IP 层下沉到驱动 RX 软中断之前，性能比 Netfilter 高一个数量级，是现代高性能网络方案（Cilium、Katran、Cloudflare）的基础。
+学完本文后，下一步是 eBPF/XDP——它把"拦截点"从 IP 层下沉到驱动 RX 软中断之前，是现代高性能网络方案（Cilium、Katran、Cloudflare）的基础。但 Netfilter 只是内核包过滤的**一支**，§17 把它与 XDP、TC BPF、cgroup skb、socket filter 摆进同一张全景图，作为进入 eBPF/XDP 的地图。
 
 ---
 
-## 17. 后续可深入（TODO）
+## 17. 内核包过滤挂载点全景图
+
+> Netfilter 只是 Linux 内核"包过滤"的**一支**——内核里还有 XDP、TC BPF、cgroup skb、socket filter 等多个挂载点。本节用一张图回答：① Netfilter 在整个过滤谱系里处于什么位置？② 各挂载点解决什么 Netfilter 解决不了的问题？③ 后续学 eBPF/XDP 时按什么顺序对位。每个挂载点的逐函数源码留到 `docs/ebpf-xdp-study.md`，本节只画清位置与边界。
+
+### 17.1 一张图：一个包从网卡到 socket，会被谁拦
+
+下面这张图把一个 RX 包（以及对应的 TX 包）从最底层网卡到最上层 socket 的完整路径画出来，标出每一处可挂载过滤程序的位置。**Netfilter 的 5 个 hook（§2）只是其中标 ★ 的一段**。
+
+```text
+                            RX 路径（收包方向，自下而上）
+═════════════════════════════════════════════════════════════════════════════
+
+   ┌─────────────┐
+   │  NIC 硬件   │  收到以太网帧，DMA 到环形缓冲
+   └──────┬──────┘
+          │  触发硬中断 → NAPI poll
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ① XDP（native）   BPF_PROG_TYPE_XDP              │  ← 最早！
+   │     驱动 xdp_buff（还不是 sk_buff），在 NAPI       │     在 sk_buff 诞生之前
+   │     软中断上下文里运行，早于内存分配               │     就能 drop/redirect/改包
+   │     入口：驱动 ndo_bpf → bpf_prog_run              │
+   └──────┬──────────────────────────────────────────────┘
+          │  XDP_PASS：驱动构造 sk_buff
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ② XDP（generic）  do_xdp_generic()                │  ← 没有 native 支持时的
+   │     net/core/dev.c:5656                            │     软件回退，在
+   │     netif_receive_generic_xdp()  dev.c:5576        │     netif_receive_skb 附近
+   │     此时已是 sk_buff，比 native 晚、比下面的早     │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ③ TC ingress（cls_bpf）  cls_bpf_classify()       │  ← qdisc ingress 钩子
+   │     net/sched/cls_bpf.c:81                         │     sk_buff 已完整，
+   │     BPF_PROG_TYPE_SCHED_CLS / SCHED_ACT            │     可改包、可重定向
+   │     挂载点：sch_handle_ingress()  dev.c            │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ④ Netfilter PRE_ROUTING  ★ NF_INET_PRE_ROUTING    │  ← 本文主角（§2~§9）
+   │     ip_input.c:612  NF_HOOK → nf_hook_slow         │     IP 层入口，路由判定前
+   │     iptables raw/mangle/nat、conntrack 在此启动     │
+   ├─────────────────────────────────────────────────────┤
+   │  ⑤ Netfilter LOCAL_IN  ★ NF_INET_LOCAL_IN         │
+   │     ip_input.c:262                                 │     路由判定为本机、交 L4 前
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ⑥ cgroup ingress  BPF_CGROUP_RUN_PROG_INET_INGRESS│  ← 绑定到 socket 所属
+   │     net/core/filter.c:148                          │     cgroup 的 BPF 程序
+   │     → __cgroup_bpf_run_filter_skb  cgroup.c:1561   │     可做容器级 ACL
+   │     BPF_PROG_TYPE_CGROUP_SKB                       │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ⑦ Socket filter  sk_filter_trim_cap()             │  ← 最晚！离应用最近
+   │     net/core/filter.c:133                          │     cBPF（SO_ATTACH_FILTER）
+   │     被 tcp_filter()/udp.c:2403/sock.c:551 调用      │     或 eBPF（SO_ATTACH_BPF，
+   │     BPF_PROG_TYPE_SOCKET_FILTER                    │     BPF_PROG_TYPE_SOCKET_FILTER）
+   │     libpcap/tcpdump 的底层就是它                   │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+      socket 接收队列 → 唤醒 recvmsg()
+
+
+                            TX 路径（发包方向，自上而下）
+═════════════════════════════════════════════════════════════════════════════
+
+      sendmsg()/tcp_sendmsg() ── 构造 skb 入发送队列
+          │
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ⑥' cgroup egress  BPF_CGROUP_RUN_PROG_INET_EGRESS │  ← ip_output.c:322/341
+   │     → __cgroup_bpf_run_filter_skb                  │     本机出口的容器级过滤
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ④' Netfilter LOCAL_OUT  ★ NF_INET_LOCAL_OUT       │  ← ip_output.c:120
+   │     本机产生报文、构造 IP 头后                       │
+   ├─────────────────────────────────────────────────────┤
+   │  ④' Netfilter POST_ROUTING ★ NF_INET_POST_ROUTING  │  ← ip_output.c:401/417/422
+   │     即将进入邻居/网卡发送，SNAT/MASQUERADE 在此      │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ③' TC egress（cls_bpf）  sch_handle_egress        │  ← qdisc egress 钩子
+   │     BPF_PROG_TYPE_SCHED_CLS                        │
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+   ┌─────────────────────────────────────────────────────┐
+   │  ②' XDP egress / devmap_xmit                       │  ← 较少用，多为 redirect
+   └──────┬──────────────────────────────────────────────┘
+          ▼
+      dev_queue_xmit → qdisc → ndo_start_xmit → NIC
+```
+
+读图要点：
+
+- **编号即执行顺序**：RX 方向 ①→⑦ 越来越晚、越来越接近应用；编号带 `'` 的是 TX 方向对应点。
+- **★ 标 Netfilter**：①②③⑥⑦ 都不是 Netfilter，只有 ④⑤（及 TX 侧 ④'）是。Netfilter 占据的是 **IP 层这一段**，既不是最早也不是最晚。
+- **两套数据结构边界**：①XDP native 工作在 `xdp_buff`（驱动私有、未分配 sk_buff），②及之后都工作在 `sk_buff`。这是 XDP native 性能碾压的根本原因——它跳过了 sk_buff 分配。
+- **cBPF vs eBPF**：⑦ Socket filter 是 cBPF 的原生场景（1992 年 McCanne 发明 BPF 就是为它），2014 年 eBPF 扩展了它；①②③⑥ 的底层虚拟机统一在 `bpf_prog_run()`，eBPF verifier 是公共关卡。
+
+### 17.2 逐挂载点补充
+
+上图的程序类型、入口文件:行、能做什么已写明，此处只补图里放不下的信息：
+
+| # | 挂载点 | 能力边界（图里没说的） | 谁调用它（典型调用者） |
+|---|--------|----------------------|----------------------|
+| ① | XDP native | 只能看 L2~L3 头，无 socket 上下文，无 conntrack | NAPI poll 内、驱动代码 |
+| ② | XDP generic | 比 native 晚，性能优势大打折扣 | `netif_receive_skb` 路径 |
+| ③ | TC ingress/egress | 在 qdisc 层，能看完整 L2~L4，但晚于 XDP | `sch_handle_ingress/egress` |
+| ④ | **Netfilter 5 hooks** ★ | 只在 IP 层，ARP/bridge/三层以下够不着；规则线性扫描 | `NF_HOOK` 宏散布在 IP 收发路径 |
+| ⑥ | cgroup skb | 只能 pass/drop，绑定到 cgroup，作用域受 cgroup 树限制 | `BPF_CGROUP_RUN_PROG_INET_INGRESS/EGRESS` |
+| ⑦ | Socket filter | 只能 pass/drop，每个 socket 独立，无全局状态（除非用 map） | `tcp_filter`(tcp.h:1688)、`udp.c:2403`、`sock.c:551` 等 |
+
+补充说明：
+
+- **④ 与 Netfilter 的关系**：这一行就是本文前 16 节的全部内容。`BPF_PROG_TYPE_NETFILTER`（见 §18 TODO）是较新的融合点——让 eBPF 程序也能注册成 `nf_hook_ops`，本质仍是 Netfilter hook，只是后端从 iptables 字节码换成 eBPF 字节码。
+- **⑦ 的两副面孔**：`sk_filter_trim_cap` 是**汇聚点**——无论 cBPF 还是 eBPF socket filter，最终都汇到这里。差异只在 `bpf_prog` 的来源（cBPF 经 `sk_unattached_filter_create` 转译，eBPF 经 `bpf_prog_get_type` 取 fd）。所以"Socket 滤包"的源码精读只需看这一个函数 + verdict 语义，不必单独成篇。
+- **cBPF 是历史，eBPF 是现在**：①②③⑥⑦ 的 cBPF 路径在 v7.1 里大多经 `bpf_migrate_filter()` 转成 eBPF 再跑，cBPF 指令集已退化为"入口格式"。真正值得精读的是统一的 `bpf_prog_run()` 和 verifier。
+
+### 17.3 为什么会有这么多挂载点：作用域与能力的差异
+
+执行顺序与性能梯度上图已标清（①最早/最快 → ⑦最晚/最慢）。挂载点之所以这么多，是因为**作用域**和**能力**两个维度上各有取舍，没有任何一个能覆盖所有需求：
+
+**作用域（越晚越聚焦到单个连接）**
+
+| 挂载点 | 作用域 | 能看到什么 |
+|--------|--------|-----------|
+| ①XDP / ③TC | 网卡 / qdisc | L2~L4 头，看不到 socket、看不到进程 |
+| ④Netfilter | 整个 netns | 5 元组，看不到进程（除非用 owner match） |
+| ⑥cgroup | 一个 cgroup 树 | 关联到容器/进程组 |
+| ⑦socket filter | 单个 socket | 唯一能精确到"某个连接"的挂载点 |
+
+**能力（能否改包 / 送用户态 / 有连接状态）**
+
+| 能力 | ①XDP | ③TC | ④Netfilter | ⑥cgroup | ⑦socket |
+|------|------|-----|-----------|---------|---------|
+| 改包内容 | ✅(L2/L3头) | ✅(L2~L4) | ✅(mangle/NAT) | ❌(只 verdict) | ❌(只 verdict) |
+| 重定向到另一网卡 | ✅(DEVMAP) | ✅(redirect) | ⚠️(需 mark+route) | ❌ | ❌ |
+| 送用户态裁决 | ❌ | ❌ | ✅(nfqueue) | ❌ | ❌ |
+| 连接跟踪状态 | ❌ | ❌ | ✅(conntrack) | ❌ | ❌ |
+
+按需求选挂载点：drop 大流量 DDoS → ①XDP（sk_buff 分配前就 drop）；精细策略且要性能 → ③TC BPF；复用 iptables 生态/做 NAT → ④Netfilter（生态最全但最慢）；容器级 ACL → ⑥cgroup；应用自己做协议过滤 → ⑦socket filter。
+
+Netfilter 慢在哪：conntrack 表查找、iptables 规则线性扫描、每包 `nf_hook_state` 初始化——XDP/TC BPF 用 map + verifier 直连，绕开这些。但 XDP 能力太弱（无 conntrack、不能送用户态），适合做 Netfilter 前面的"挡箭牌"而非替代品。Cilium 的架构正是：①XDP 做 L4 LB + early drop，③TC BPF 做策略，④Netfilter 逐渐退役。
+
+### 17.4 与本文的衔接：Netfilter 在谱系里的定位
+
+Netfilter 的独特价值来自"中间位置 + 能力最全"：
+
+1. **它是最早"可改包 + 有连接状态"的挂载点**。①②③ 都早于它，但要么无 conntrack（XDP）、要么 conntrack 要自己用 map 实现（TC BPF）。Netfilter 的 conntrack/NAT 生态（§7、§8）是它至今无法被完全替代的根本原因。
+
+2. **它是唯一能送用户态裁决的挂载点**。nfqueue（§13）让 IDS/IPS 能在内核里"挂起"一个包等用户态判决，XDP/TC/socket filter 都做不到。这是 suricata 等工具的根基。
+
+3. **它的"慢"是设计选择，不是缺陷**。`nf_hook_slow` + conntrack 查找的开销，换来的是"任意优先级 hook + 完整连接状态 + 用户态回注"的能力组合。当你不需要这些能力时，才该把过滤前移到 ①③。
+
+4. **`BPF_PROG_TYPE_NETFILTER` 是融合而非替代**。§18 TODO 里这条，本质是让 eBPF 程序作为 `nf_hook_ops` 注册进 Netfilter 的 5 个 hook——位置没变、能力没变，只是后端从 iptables/nftables 字节码换成 eBPF 字节码。所以学完本文再学它，几乎没有新概念，只是换一种"写 hook"的语言。
+
+### 17.5 后续学习的对位建议
+
+按这张全景图，`docs/ebpf-xdp-study.md` 的建议结构（与本文呼应）：
+
+- **先精读 ①XDP**：它是 eBPF 性能护城河的源头。重点 `netif_receive_generic_xdp`（generic 路径，已有 sk_buff 易懂）、`bpf_prog_run`、verifier 对 XDP 程序的限制。
+- **再讲 ③TC BPF**：`cls_bpf_classify` 与 qdisc 的衔接，正好复用本文 §11 可观测性里 `tc filter` 的命令对照。
+- **然后讲 ⑥cgroup + ⑦socket filter**：这两个共享 `bpf_prog_run` 的 skb verdict 路径，`sk_filter_trim_cap` 是汇聚点，cgroup 的 ingress/egress 宏在本文已列出调用点。
+- **最后讲 ④`BPF_PROG_TYPE_NETFILTER`**：作为"eBPF 回到 Netfilter"的收尾，对位本文 §4 `nf_hook_slow`——同一套 hook，换字节码引擎。
+
+验收自检：
+
+- [ ] 能不看图说出 ①~⑦ 七个 RX 挂载点的执行顺序与各自工作在 `xdp_buff` 还是 `sk_buff`
+- [ ] 能解释为什么 XDP native 比 Netfilter 快一个数量级（sk_buff 分配 + conntrack + 线性规则）
+- [ ] 能说清 `sk_filter_trim_cap` 为何是 cBPF/eBPF socket filter 的共同汇聚点
+- [ ] 能判断一个需求该用哪个挂载点（DDoS drop → XDP；容器 ACL → cgroup；NAT → Netfilter；tcpdump → socket filter）
+
+---
+
+## 18. 后续可深入（TODO）
 
 > 核心源码章节（§4~§9 共 6 节 + §13~§15 共 3 节扩展专题）已全部填充完成，对照 v7.1-rc7 源码逐行注解。以下为后续可深入专题：
 
@@ -2901,6 +3080,6 @@ Netfilter 是 Linux 网络的"控制平面"，把 5 个 hook 点埋在 IP 协议
 - [x] §14 `nf_flowtable` 流卸载（含 `flow_offload_add`、`nf_flow_offload_ip_hook` 快路径、与 conntrack 协作）
 - [x] §15 `nf_conntrack_helper` + expectation（含 `nf_ct_expect_related`、`nf_ct_find_expectation`、FTP 完整流程）
 - [ ] `nf_synproxy`：SYN flood 防御，在 Netfilter 层代理握手
-- [ ] BPF hook (`NF_HOOK_OP_BPF` / `BPF_PROG_TYPE_NETFILTER`)：Netfilter 与 eBPF 的融合点，衔接下一阶段 eBPF/XDP 学习
+- [ ] BPF hook (`NF_HOOK_OP_BPF` / `BPF_PROG_TYPE_NETFILTER`)：Netfilter 与 eBPF 的融合点，位置/能力不变、只换字节码后端（见 §17.4，衔接下一阶段 eBPF/XDP 学习）
 - [ ] `nf_tables_offload`：nftables 规则卸载到网卡硬件（flow table 的规则级版本）
 - [ ] `nf_conntrack_acct` / `nf_conntrack_timestamp`：conntrack 扩展区的计费与时间戳

@@ -13,29 +13,7 @@
 
 ## 1. UDP 协议基础
 
-**作用**：用户数据报协议（User Datagram Protocol），在 IP 之上提供**无连接、不可靠、基于数据报**的端到端传输服务。
-
-**核心 RFC**：RFC 768。
-
-**典型特征**：
-- 不保证到达、不保证顺序、不重传、无流量控制。
-- 保留报文边界：一次 `sendto()` 对应一个 UDP 数据报，接收端一次 `recvfrom()` 读取一个完整数据报（除非被截断）。
-- 头部极小，仅 8 字节，延迟低、开销小，适合 DNS、QUIC、音视频、Telemetry 等场景。
-
-**典型交互**：
-
-```text
-主机 A (10.0.0.1:12345) 想发给主机 B (10.0.0.2:53)
-→ 应用层调用 sendto()
-→ 内核构造 UDP 头 + IP 头，选路后发出
-→ 对端收到后根据目的端口查找 socket，放入接收队列
-→ 应用层调用 recvfrom() 读取
-
-注意：
-- 没有“连接建立”阶段
-- 没有确认、没有重传（应用层自行实现）
-- 丢包或校验失败时通常静默丢弃
-```
+UDP（User Datagram Protocol，RFC 768）在 IP 之上提供**无连接、不可靠、基于数据报**的端到端传输：不保证到达/顺序、不重传、无流控；保留报文边界（一次 `sendto()` 对应一个数据报，`recvfrom()` 读一个完整数据报，除非被截断）；头部仅 8 字节，适合 DNS、QUIC、音视频等场景。丢包或校验失败通常静默丢弃。
 
 ---
 
@@ -859,77 +837,7 @@ enum {
 
 ---
 
-## 11. 完整 UDP 发送/接收时序图
-
-### 11.1 发送时序
-
-```text
-应用层      sendto(fd, buf, len, 0, &addr, addrlen)
-  │              │
-  ▼              ▼
-socket 层  sys_sendto() → sock_sendmsg()
-  │              │
-  ▼              ▼
-inet 层    inet_sendmsg() → udp_sendmsg()
-  │              │
-  │              ▼
-  │      解析目的地址 / cmsg / 路由查找
-  │              │
-  │              ▼
-  │      ip_make_skb() / ip_append_data()
-  │              │
-  │              ▼
-  │      udp_send_skb()  填 UDP 头、校验和
-  │              │
-  │              ▼
-  │      ip_send_skb() → ip_local_out() → ip_output()
-  │              │
-  │              ▼
-  │      neigh + dev_queue_xmit()  填 MAC 并发包
-  │              │
-  ▼              ▼
-网卡驱动    发送成功
-```
-
-### 11.2 接收时序
-
-```text
-网卡驱动    收到帧
-  │              │
-  ▼              ▼
-网络层     __netif_receive_skb_core()
-  │              │
-  │              ▼
-  │      ip_rcv() → ip_rcv_finish_core()
-  │              │
-  │              ▼
-  │      [可选] udp_v4_early_demux()  attach socket
-  │              │
-  │              ▼
-  │      ip_local_deliver_finish() → udp_rcv()
-  │              │
-  │              ▼
-  │      校验头、uh->len、trim、csum_init
-  │              │
-  │              ▼
-  │      inet_steal_sock() / __udp4_lib_lookup()
-  │              │
-  │              ▼
-  │      udp_unicast_rcv_skb() → udp_queue_rcv_skb()
-  │              │
-  │              ▼
-  │      udp_queue_rcv_one_skb() → __udp_queue_rcv_skb()
-  │              │
-  │              ▼
-  │      __udp_enqueue_schedule_skb()  入 sk_receive_queue
-  │              │
-  ▼              ▼
-应用层     recvfrom() → udp_recvmsg()  读取并校验
-```
-
----
-
-## 12. 小结
+## 11. 小结
 
 - **无连接、无状态**是 UDP 的核心特征，Linux 内核没有为它维护类似 TCP 的连接状态机。
 - **端口/socket 查找**是 UDP 的关键路径：Linux 用 `hash` + `hash2` + `hash4` 三张表加速，connected socket 可走 O(1) 精确匹配，wildcard socket 通过 `compute_score()` 评分择优。

@@ -12,19 +12,7 @@
 
 ## 1. ARP 协议基础
 
-**作用**：把网络层地址（IPv4）解析成链路层地址（MAC），只作用于同一二层网段。
-
-**核心 RFC**：RFC 826。
-
-**典型交互**：
-
-```text
-主机 A (192.148.1.2) 想发给 192.148.1.3
-→ A 不知道 1.3 的 MAC
-→ A 发 ARP Request（广播：谁有 192.148.1.3？）
-→ 1.3 回 ARP Reply（单播：我的 MAC 是 xx:xx:xx:xx:xx:xx）
-→ A 缓存到 ARP 表
-```
+**作用**：把网络层地址（IPv4）解析成链路层地址（MAC），只作用于同一二层网段。核心 RFC 826。
 
 ARP 报文格式本身**不保证可靠性**，也没有 ARP 层校验和（依赖链路层校验，如以太网 FCS）。但 Linux 的 neighbour 子系统会按 `retrans_time_ms`、`mcast_solicit`、`ucast_solicit` 等参数重复发送 ARP Request；因此不能把 Linux 实现概括为“ARP 无重传”。
 
@@ -1897,95 +1885,9 @@ static void arp_error_report(struct neighbour *neigh, struct sk_buff *skb)
 
 ---
 
-## 12. 完整 ARP 解析时序图
+## 12. 探测次数与类型
 
-### 12.1 正常解析成功
-
-```text
-时间轴 ──────────────────────────────────────────────>
-
-应用层        sendto()
-  │              │
-  ▼              ▼
-IP 层      ip_queue_xmit(skb, dst=192.148.1.3)
-  │              │
-  │              ▼
-  │      dst_neigh_output(dst, skb)
-  │              │
-  │              ▼
-  │      neigh->output = neigh_resolve_output
-  │              │
-  │              ▼
-  │      neigh_event_send(neigh, skb)
-  │              │
-  │              ▼
-  │      __neigh_event_send()
-  │      nud_state = NUD_INCOMPLETE
-  │      skb → arp_queue
-  │      neigh_add_timer(RETRANS_TIME)
-  │      neigh_probe() ──► arp_solicit() ──► arp_send_dst(REQUEST)
-  │              │
-  │              │  等待 ARP Reply ...
-  │              │
-  │              ▼
-  │      arp_rcv() ──► arp_process()
-  │              │
-  │              ▼
-  │      neigh_update(n, sha, NUD_REACHABLE)
-  │              │
-  │              ▼
-  │      neigh_update_process_arp_queue()
-  │      从 arp_queue 取出 skb
-  │              │
-  │              ▼
-  │      neigh->output = neigh_connected_output
-  │      dev_hard_header() 填充 MAC
-  │      dev_queue_xmit(skb)
-  │              │
-  ▼              ▼
-网卡驱动     发送成功
-```
-
-### 12.2 状态机转换完整图
-
-```text
-NUD_NONE / NUD_FAILED
-    └─ 新 IP 包触发
-       → NUD_INCOMPLETE
-           ├─ 收到 ARP Reply
-           │  → NUD_REACHABLE
-           └─ probes >= neigh_max_probes()
-              → NUD_FAILED
-
-NUD_REACHABLE
-    └─ reachable_time 到期
-       ├─ neigh->used 仍在 DELAY_PROBE_TIME 窗口内
-       │  → NUD_DELAY
-       └─ 久未使用
-          → NUD_STALE
-
-NUD_STALE
-    └─ 再次发包触发
-       → NUD_DELAY
-
-NUD_DELAY
-    └─ DELAY_PROBE_TIME 到期
-       ├─ confirmed 已更新
-       │  → NUD_REACHABLE
-       └─ confirmed 未更新
-          → NUD_PROBE
-
-NUD_PROBE
-    ├─ 收到 ARP Reply
-    │  → NUD_REACHABLE
-    └─ probes >= neigh_max_probes()
-       ├─ NTF_EXT_VALIDATED
-       │  → NUD_STALE
-       └─ 普通条目
-          → NUD_FAILED
-```
-
-### 12.3 探测次数与类型
+完整 ARP 解析的逐函数调用链见 §11，NUD 状态转换图见 §4.3，此处仅补充各阶段的探测次数与类型。
 
 ```text
 NUD_INCOMPLETE

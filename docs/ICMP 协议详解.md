@@ -16,30 +16,7 @@
 
 ## 1. ICMP 协议基础
 
-作用：ICMP（Internet Control Message Protocol，互联网控制报文协议）是 TCP/IP 协议栈的网络层辅助协议，用于在 IP 主机、路由器之间传递控制消息与差错报告。它不承载用户数据，而是承载“关于 IP 数据报的报告”。
-
-核心 RFC：RFC 792；RFC 1122 对主机行为做了大量补充；RFC 1812 对路由器行为做了补充。
-
-典型交互：
-
-```text
-主机 A  ping  主机 B
-→ A 构造 ICMP Echo Request（type=8, code=0），填入 id/sequence
-→ 封装到 IP 数据报（protocol=1），目的地址为 B
-→ B 收到后校验 ICMP checksum，交给 icmp_rcv()
-→ B 在 icmp_echo() 里把 type 改成 0（Echo Reply），原样回显数据
-→ A 收到 Echo Reply，ping 程序根据 id/sequence 匹配并计算时延
-```
-
-```text
-主机 A 访问一个不可达端口
-→ A 发 TCP SYN / UDP 报文到某主机
-→ 中间路由器无路由 / 目的主机无监听进程
-→ 路由器/主机回送 ICMP Destination Unreachable（type=3, code=0/1/2/3）
-→ A 的传输层把该错误映射为 EHOSTUNREACH / ECONNREFUSED 等 errno
-```
-
-重要原则：ICMP 本身不保证可靠传输，也没有重传机制；它依赖 IP 进行“尽力而为”交付。
+ICMP（Internet Control Message Protocol，RFC 792；RFC 1122 补充主机行为，RFC 1812 补充路由器行为）是 IP 的网络层辅助协议，不承载用户数据，只传递“关于 IP 数据报的控制消息与差错报告”。它本身不保证可靠、无重传，依赖 IP 尽力而为交付。
 
 ---
 
@@ -377,46 +354,7 @@ enum skb_drop_reason ping_rcv(struct sk_buff *skb)
 }
 ```
 
-`ping_lookup()` 根据 `(net, saddr, daddr, id)` 找到对应的 ping socket，把 skb 放入该 socket 的接收队列，用户态 `ping`/`recvfrom` 即可读到数据。
-
-### 5.3 ping 请求/回复完整时序
-
-```text
-用户态：ping 程序
-  │
-  ▼
-创建 ICMP raw socket（或通过 ping socket）
-  │
-  ▼
-sendto() 构造 ICMP Echo Request
-  │
-  ▼
-内核：ping_v4_sendmsg() → ip_push_pending_frames() → ip_output()
-  │
-  ▼
-网络 → 对端主机
-  │
-  ▼
-对端：ip_local_deliver() → icmp_rcv()
-  │
-  ▼
-icmp_echo() 生成 ICMP Echo Reply
-  │
-  ▼
-icmp_reply() → ip_route_output_key() → ip_append_data() → ip_push_pending_frames()
-  │
-  ▼
-网络 → 本机
-  │
-  ▼
-本机：ip_local_deliver() → icmp_rcv()
-  │
-  ▼
-ping_rcv() → ping_lookup() → sock_queue_rcv_skb()
-  │
-  ▼
-用户态 recvfrom() 收到 Echo Reply
-```
+`ping_lookup()` 根据 `(net, saddr, daddr, id)` 找到对应的 ping socket，把 skb 放入该 socket 的接收队列，用户态 `ping`/`recvfrom` 即可读到数据。Echo Request/Reply 的完整收发流程见 §12.1。
 
 ---
 

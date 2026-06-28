@@ -758,15 +758,6 @@ Reader (nf_hook_slow, 持 rcu_read_lock):
 
 **举例**：`iptable_filter` 模块初始化时注册 3 个 hook（INPUT/FORWARD/OUTPUT），每个 hook 的回调都是 `ipt_do_table`，`priv` 指向该表的 `xt_table` 结构。报文经过关卡时，`nf_hook_slow` 调 `ipt_do_table(skb, state, table)` 跑规则——见 §6。
 
-### 5.3 常见注册来源
-
-| 来源 | hook_ops_type | 典型模块 |
-|------|---------------|----------|
-| iptables (xtables) | `NF_HOOK_OP_UNDEFINED` | `iptable_filter`/`iptable_nat`/`iptable_mangle`（每个表注册一个 hook，回调里跑 `ipt_do_table`） |
-| nftables | `NF_HOOK_OP_NF_TABLES` | `nf_tables_chain_type` |
-| BPF | `NF_HOOK_OP_BPF` | `BPF_PROG_TYPE_NETFILTER`（较新） |
-| 内核内置模块 | — | `nf_conntrack`（注册 PRE_ROUTING/LOCAL_OUT 做 conntrack）、`nf_nat`、`iptable_raw` |
-
 ---
 
 ## 6. iptables（xtables）后端：`ipt_do_table`

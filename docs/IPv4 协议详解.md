@@ -15,23 +15,7 @@
 
 ## 1. IP 协议基础
 
-作用：IP（Internet Protocol，互联网协议）是 TCP/IP 协议栈的网络层协议，负责把数据包从源主机路由到目的主机。它提供的是无连接、尽力而为（best-effort）的交付服务，不保证可靠性、顺序性和不重复性。
-
-核心 RFC：RFC 791。
-
-典型交互：
-
-```text
-主机 A (192.168.1.2) 要发一个 TCP 段给 192.168.1.3
-→ TCP 把数据交给 IP 层
-→ IP 封装成 IP 数据报（填源/目的 IP、TTL、协议号、校验和等）
-→ 如果目的在同一二层网段，ARP 解析目的 MAC 后直接发
-→ 如果在不同网段，查路由表交给下一跳网关
-→ 转发时每经过一个路由器 TTL 减 1，逐跳转发直到目的主机
-→ 目的主机 IP 层解封装，根据 protocol 字段交给 TCP/UDP/ICMP 等上层
-```
-
-与 ARP 的关系：ARP 是 IP 的“辅助协议”。IP 只知道下一跳的 IP 地址，真正发以太网帧时需要 ARP（或静态邻居表）把 IP 解析成 MAC。
+IP（Internet Protocol，RFC 791）是 TCP/IP 的网络层协议，提供无连接、尽力而为（best-effort）的交付：不保证可靠性、顺序性、不重复性，负责把数据包从源主机逐跳路由到目的主机。IP 只知道下一跳的 IP 地址，真正发出以太网帧时需由 ARP（或静态邻居表）把下一跳 IP 解析成 MAC，因此 ARP 是 IP 的辅助协议。
 
 ---
 
@@ -1256,101 +1240,11 @@ Linux IPv4 路由子系统主要分两层：
 
 ---
 
-## 10. 完整收发时序图
+## 10. IP 转发完整流程图
 
-### 10.1 本机接收一个 TCP 报文
+本机收发调用链见 §4.1 / §5.1，此处仅保留转发路径的完整流程图。
 
-```text
-时间轴 ──────────────────────────────────────────────>
-
-网卡驱动    收到以太网帧
-  │
-  ▼
-__netif_receive_skb_core()
-  │
-  ▼
-ip_rcv()
-  │
-  ▼
-ip_rcv_core()
-  ├─ 检查 version/ihl
-  ├─ 校验 IP 头部 checksum
-  ├─ 按 tot_len 截断 skb
-  └─ 设置 transport_header
-  │
-  ▼
-ip_rcv_finish() → ip_rcv_finish_core()
-  ├─ early_demux（可选）
-  ├─ ip_route_input_noref()   决定是本机/转发/广播/组播
-  ├─ 处理 IP options（如果有）
-  │
-  ▼
-dst_input()
-  │
-  ▼
-ip_local_deliver()
-  ├─ 如果是分片 → ip_defrag() 等待重组
-  ├─ NF_INET_LOCAL_IN
-  │
-  ▼
-ip_local_deliver_finish()
-  ├─ __skb_pull() 去掉 IP 头
-  │
-  ▼
-ip_protocol_deliver_rcu()
-  ├─ raw_local_deliver()
-  └─ inet_protos[IPPROTO_TCP] → tcp_v4_rcv()
-```
-
-### 10.2 本机发送一个 TCP 报文
-
-```text
-时间轴 ──────────────────────────────────────────────>
-
-tcp_write_xmit()
-  │
-  ▼
-tcp_transmit_skb()
-  │
-  ▼
-ip_queue_xmit() → __ip_queue_xmit()
-  ├─ 查路由（socket dst 缓存 或 ip_route_output_flow）
-  ├─ skb_push() / skb_reset_network_header()
-  ├─ 填充 IP 头：version/ihl/tos/ttl/protocol/saddr/daddr/id/frag_off
-  ├─ 处理 IP options（如果有）
-  │
-  ▼
-ip_local_out() → __ip_local_out()
-  ├─ iph_set_totlen()
-  ├─ ip_send_check()
-  ├─ NF_INET_LOCAL_OUT
-  │
-  ▼
-dst_output() → ip_output()
-  ├─ NF_INET_POST_ROUTING
-  │
-  ▼
-ip_finish_output() → __ip_finish_output()
-  ├─ GSO 处理
-  ├─ 如果 skb->len > mtu → ip_fragment() → ip_do_fragment()
-  │
-  ▼
-ip_finish_output2()
-  ├─ ip_neigh_for_gw() 找到下一跳 neighbour
-  │
-  ▼
-neigh_output() → 邻居子系统
-  ├─ 需要 ARP → neigh_resolve_output() → ARP Request
-  └─ MAC 已缓存 → neigh_connected_output()
-       │
-       ▼
-  dev_hard_header() 填以太网头
-       │
-       ▼
-  dev_queue_xmit()
-```
-
-### 10.3 IP 转发一个报文
+### 10.1 IP 转发一个报文
 
 ```text
 ip_rcv() → ip_rcv_finish() → dst_input()

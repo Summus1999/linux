@@ -594,47 +594,7 @@ tcp_add_backlog(sk, skb)   net/ipv4/tcp_ipv4.c:1899
 
 ---
 
-## 6. 时序图：一次 TCP echo 请求的收发全过程
-
-```text
-用户进程 A                      内核协议栈                       网卡
-   │                               │                              │
-   │ sendmsg("hello")              │                              │
-   │──────────────────────────────▶│                              │
-   │                               │ tcp_sendmsg()                │
-   │                               │ tcp_transmit_skb()           │
-   │                               │ ip_queue_xmit()              │
-   │                               │ dev_queue_xmit()             │
-   │                               │ ndo_start_xmit()             │
-   │                               │─────────────────────────────▶│
-   │                               │                              │ DMA → 网卡发送
-   │                               │◀─────────────────────────────│ TX completion
-   │                               │ napi_consume_skb()           │
-   │                               │ tcp_wfree()                  │
-   │                               │                              │
-   │                               │◀──── 对端回包（"hello"）─────│
-   │                               │ 硬中断 → napi_schedule()     │
-   │                               │ net_rx_action()              │
-   │                               │ napi->poll()                 │
-   │                               │ napi_gro_receive()           │
-   │                               │ netif_receive_skb_list_internal()│
-   │                               │ ip_rcv()                     │
-   │                               │ ip_local_deliver()           │
-   │                               │ tcp_v4_rcv()                 │
-   │                               │ tcp_rcv_established()        │
-   │                               │ tcp_data_queue()             │
-   │                               │ tcp_data_ready() → wakeup    │
-   │ recvmsg()                     │                              │
-   │──────────────────────────────▶│                              │
-   │                               │ tcp_recvmsg()                │
-   │                               │ skb_copy_datagram_msg()      │
-   │                               │ consume_skb() → sock_rfree() │
-   │◀──────────────────────────────│ 返回 "hello"                 │
-```
-
----
-
-## 7. 函数/文件索引速查表
+## 6. 函数/文件索引速查表
 
 | 阶段 | 关键函数 | 文件 | 行号 |
 |------|----------|------|------|
@@ -668,7 +628,7 @@ tcp_add_backlog(sk, skb)   net/ipv4/tcp_ipv4.c:1899
 
 ---
 
-## 8. 小结
+## 7. 小结
 
 Linux 网络栈的收发路径可以用两条主线概括：
 
@@ -683,4 +643,4 @@ Linux 网络栈的收发路径可以用两条主线概括：
 4. **发送/接收内存记账**：`skb_set_owner_w/r()` 把 skb 生命周期与 `sk_wmem_alloc` / `sk_rmem_alloc` 绑定，`tcp_wfree()` / `sock_rfree()` 在 skb 释放时归还配额；
 5. **NAPI + GRO**：用软中断轮询替代每包硬中断，用 GRO 聚合减少协议栈入口开销。
 
-把这张图和 `docs/Linux 网络框架核心.md` 里的数据结构章节对照阅读，就能从「函数调用顺序」和「数据结构协作」两个维度，建立对 Linux 网络协议栈的完整理解。
+把 §1 的总览图和 `docs/Linux 网络框架核心.md` 里的数据结构章节对照阅读，就能从「函数调用顺序」和「数据结构协作」两个维度，建立对 Linux 网络协议栈的完整理解。
